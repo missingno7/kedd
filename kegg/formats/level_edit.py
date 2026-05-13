@@ -71,43 +71,110 @@ class EditableLevelStore:
             cells.append(self.get_cell(level_number, x, y))
         return RenderLevel(number=level_number, source_record=level_number, cells=cells)
 
+    @staticmethod
+    def _is_non_spell_breakable_sprite(sprite_id: int | None) -> bool:
+        return sprite_id is not None and 0 <= sprite_id <= 47
+
+    @staticmethod
+    def _is_spell_variant_sprite(sprite_id: int | None) -> bool:
+        return sprite_id is not None and 48 <= sprite_id <= 95
+
     def set_brick_sprite_id(self, level_number: int, x: int, y: int, sprite_id: int | None) -> None:
-        current = self.get_word(level_number, x, y)
-        low = current & 0x00FF
+        """Place a brick selected from the editor's non-spell brick palette.
+
+        The editor intentionally does not expose sprite ids 48..95 directly:
+        those are the spell-marked variants of brick ids 0..47.
+
+        If the edited cell already has a hidden spell drop and the newly chosen
+        brick is a spell-compatible base brick 0..47, the editor preserves the
+        drop metadata and stores the corresponding dotted +48 variant.
+
+        If the newly chosen brick does not support spells (96+), any existing
+        hidden spell metadata is cleared.
+        """
         if sprite_id is None:
-            # Empty cells should not keep hidden drop metadata.
             self.set_word(level_number, x, y, 0)
             return
         if not (0 <= sprite_id <= 255):
             raise ValueError(f"brick sprite id out of range: {sprite_id}")
-        stored_id = sprite_id + 1
+        if 48 <= sprite_id <= 95:
+            raise ValueError(
+                f"brick sprite id {sprite_id} is a spell-marked variant and "
+                "must be created by assigning a spell to its base brick"
+            )
+
+        current_cell = self.get_cell(level_number, x, y)
+        existing_spell_low = current_cell.flags if current_cell.powerup_code is not None else 0
+
+        if self._is_non_spell_breakable_sprite(sprite_id) and existing_spell_low:
+            # Preserve the existing hidden spell and convert the newly selected
+            # base brick to its dotted spell-marked +48 variant.
+            stored_sprite_id = sprite_id + 48
+            low = existing_spell_low
+        else:
+            # Either the target brick is 96+ / otherwise non-spell-capable, or
+            # there was no existing spell to preserve.
+            stored_sprite_id = sprite_id
+            low = 0
+
+        stored_id = stored_sprite_id + 1
         if stored_id > 255:
-            raise ValueError(f"brick sprite id cannot be stored as 1-based byte: {sprite_id}")
+            raise ValueError(f"brick sprite id cannot be stored as 1-based byte: {stored_sprite_id}")
         self.set_word(level_number, x, y, (stored_id << 8) | low)
 
-    def set_spell_drop_type(self, level_number: int, x: int, y: int, drop_type: int | None) -> None:
-        current = self.get_word(level_number, x, y)
-        high = current & 0xFF00
+    def set_spell_drop_type(self, level_number: int, x: int, y: int, drop_type: int | None) -> bool:
+        """Assign a spell drop to a compatible brick.
+
+        Spell drops are legal only on the dotted spell variants 48..95. The
+        editor therefore auto-converts a base breakable brick 0..47 to its
+        +48 spell-marked variant when assigning a drop. Other brick families
+        (empty, 96+, unbreakable, portals, respawning) reject spell assignment.
+        """
         if drop_type is None:
-            self.set_word(level_number, x, y, high)
-            return
+            self.erase_spell(level_number, x, y)
+            return True
         if not (0 <= drop_type <= 27):
             raise ValueError(f"drop type out of range: {drop_type}")
 
-        current_low = current & 0x00FF
+        cell = self.get_cell(level_number, x, y)
+        sprite_id = cell.brick_sprite_id
+        if self._is_non_spell_breakable_sprite(sprite_id):
+            spell_sprite_id = sprite_id + 48
+            stored_id = spell_sprite_id + 1
+        elif self._is_spell_variant_sprite(sprite_id):
+            stored_id = sprite_id + 1
+        else:
+            return False
+
+        current_low = cell.flags
         # Preserve existing variant bits if there is already a drop code;
         # otherwise use the common default variant 0.
         existing_upper = current_low >> 2
         variant = current_low & 0x03 if existing_upper != 0 else 0
         low = ((drop_type + 1) << 2) | variant
-        self.set_word(level_number, x, y, high | low)
+        self.set_word(level_number, x, y, (stored_id << 8) | low)
+        return True
 
     def erase_brick(self, level_number: int, x: int, y: int) -> None:
         self.set_word(level_number, x, y, 0)
 
     def erase_spell(self, level_number: int, x: int, y: int) -> None:
         current = self.get_word(level_number, x, y)
-        self.set_word(level_number, x, y, current & 0xFF00)
+        cell = self.get_cell(level_number, x, y)
+        sprite_id = cell.brick_sprite_id
+        if self._is_spell_variant_sprite(sprite_id):
+            # Removing the spell converts 48..95 back to their base 0..47 variants.
+            base_sprite_id = sprite_id - 48
+            stored_id = base_sprite_id + 1
+            self.set_word(level_number, x, y, stored_id << 8)
+        else:
+            self.set_word(level_number, x, y, current & 0xFF00)
+
+    def clear_level(self, level_number: int) -> None:
+        """Clear the full 18x15 brick/spell grid for one level."""
+        for y in range(BRICK_GRID_HEIGHT):
+            for x in range(BRICK_GRID_WIDTH):
+                self.set_word(level_number, x, y, 0)
 
     def _record_offset(self, level_number: int) -> int:
         if not (1 <= level_number <= self.level_count):

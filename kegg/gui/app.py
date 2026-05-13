@@ -150,6 +150,7 @@ class ImageChoicePalette(ttk.Frame):
         self.selected_value = None
         self._photos: list[ImageTk.PhotoImage] = []
         self._cards: dict[object, tk.Frame] = {}
+        self._card_order: list[tk.Frame] = []
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -176,6 +177,11 @@ class ImageChoicePalette(ttk.Frame):
 
     def _on_canvas_configure(self, event: tk.Event) -> None:
         self.canvas.itemconfigure(self.window_id, width=event.width)
+        available_width = max(1, event.width - 18)
+        new_columns = max(1, available_width // (self.card_width + 8))
+        if new_columns != self.columns:
+            self.columns = new_columns
+            self._layout_cards()
 
     def _on_mousewheel(self, event: tk.Event) -> None:
         delta = -1 if event.delta > 0 else 1
@@ -195,15 +201,10 @@ class ImageChoicePalette(ttk.Frame):
         return ImageTk.PhotoImage(thumb)
 
     def _build_cards(self) -> None:
-        for index, item in enumerate(self.items):
-            row = index // self.columns
-            col = index % self.columns
+        for item in self.items:
             value = item["value"]
 
             card = tk.Frame(self.inner, bg="#303036", bd=2, relief="ridge", padx=3, pady=3)
-            card.grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
-            self.inner.grid_columnconfigure(col, weight=1)
-
             photo = self._make_photo(item["image"], max_w=self.card_width - 16, max_h=48)
             self._photos.append(photo)
             image_label = tk.Label(card, image=photo, bg="#303036")
@@ -225,6 +226,17 @@ class ImageChoicePalette(ttk.Frame):
                 widget.bind("<MouseWheel>", self._on_mousewheel)
 
             self._cards[value] = card
+            self._card_order.append(card)
+
+        self._layout_cards()
+
+    def _layout_cards(self) -> None:
+        for index, card in enumerate(self._card_order):
+            row = index // self.columns
+            col = index % self.columns
+            card.grid(row=row, column=col, padx=4, pady=4, sticky="nsew")
+        for col in range(max(self.columns, 1)):
+            self.inner.grid_columnconfigure(col, weight=1)
 
     def select(self, value, notify: bool = False) -> None:
         self.selected_value = value
@@ -264,8 +276,11 @@ class EditorPaletteTabs(ttk.Notebook):
     def _make_brick_palette(self, on_brick_select) -> ImageChoicePalette:
         brick_sprites, _ = decode_bob_sprites(self.data_dir / "KE_BRICK.BOB", self.data_dir)
         items = []
-        # The high byte stores a 1-based byte, so editable KE_BRICK ids are 0..254.
+        # Spell-marked brick sprites 48..95 are not directly editable. They are
+        # generated automatically when a spell is placed on base bricks 0..47.
         for sprite_id, image in enumerate(brick_sprites[:255]):
+            if 48 <= sprite_id <= 95:
+                continue
             items.append({"value": sprite_id, "image": image, "label": str(sprite_id)})
         return ImageChoicePalette(self, items, on_brick_select, columns=4, card_width=76)
 
@@ -290,8 +305,6 @@ class EditorPaletteTabs(ttk.Notebook):
 
 
 class LevelViewTab(ttk.Frame):
-    PREVIEW_SCALE = 4
-
     def __init__(self, parent: tk.Widget, data_dir: Path) -> None:
         super().__init__(parent)
         self.data_dir = data_dir
@@ -300,6 +313,7 @@ class LevelViewTab(ttk.Frame):
         self.fill_sprites, _ = decode_bob_sprites(data_dir / "KE_FILL.BOB", data_dir)
         self.levels = load_level_set(data_dir)
         self.level_var = tk.IntVar(value=min(2, self.level_store.level_count))
+        self.zoom_var = tk.StringVar(value="4x")
         self.view_var = tk.StringVar(value="game")
         self.show_grid_var = tk.BooleanVar(value=False)
         self.show_ids_var = tk.BooleanVar(value=False)
@@ -317,19 +331,28 @@ class LevelViewTab(ttk.Frame):
         self._enemy_slot_photos: list[ImageTk.PhotoImage | None] = [None for _ in range(8)]
         self._background_photo: ImageTk.PhotoImage | None = None
         self._metadata_refreshing = False
+
+        self.undo_stack: list[tuple[bytes, list[int]]] = []
+        self.redo_stack: list[tuple[bytes, list[int]]] = []
+        self._drag_snapshot: tuple[bytes, list[int]] | None = None
+        self._drag_button: str | None = None
+        self._drag_visited: set[tuple[int, int]] = set()
+
         self._build_ui()
         self.level_var.trace_add("write", lambda *_args: self.after_idle(self.render_level))
+        self.bind_all("<Control-z>", lambda _event: self.undo())
+        self.bind_all("<Control-y>", lambda _event: self.redo())
+        self.bind_all("<Control-Shift-Z>", lambda _event: self.redo())
         self.editor_palettes.bind("<<NotebookTabChanged>>", lambda _event: self._update_editor_status())
         self._update_editor_status()
         self.render_level()
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.columnconfigure(1, weight=0)
         self.rowconfigure(1, weight=1)
 
         toolbar = ttk.Frame(self, padding=8)
-        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        toolbar.grid(row=0, column=0, sticky="ew")
         ttk.Label(toolbar, text="Level").pack(side="left")
         spin = ttk.Spinbox(
             toolbar,
@@ -342,6 +365,17 @@ class LevelViewTab(ttk.Frame):
         spin.bind("<Return>", lambda _event: self.render_level())
         spin.bind("<FocusOut>", lambda _event: self.render_level())
 
+        ttk.Label(toolbar, text="Zoom").pack(side="left")
+        zoom_box = ttk.Combobox(
+            toolbar,
+            width=5,
+            textvariable=self.zoom_var,
+            values=["1x", "2x", "3x", "4x", "5x", "6x", "8x"],
+            state="readonly",
+        )
+        zoom_box.pack(side="left", padx=(4, 12))
+        zoom_box.bind("<<ComboboxSelected>>", lambda _event: self.render_level())
+
         ttk.Label(toolbar, text="View").pack(side="left")
         view_box = ttk.Combobox(
             toolbar,
@@ -353,16 +387,27 @@ class LevelViewTab(ttk.Frame):
         view_box.pack(side="left", padx=(4, 12))
         view_box.bind("<<ComboboxSelected>>", lambda _event: self.render_level())
 
+        ttk.Button(toolbar, text="Clear level", command=self.clear_level).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Undo", command=self.undo).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text="Redo", command=self.redo).pack(side="left", padx=(4, 0))
+
         ttk.Button(toolbar, text="Save data", command=self.save_levels).pack(side="right")
         ttk.Label(toolbar, textvariable=self.status_var).pack(side="right", padx=(0, 12))
 
-        self.preview = ScrollableImage(self)
-        self.preview.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=(0, 8))
-        self.preview.canvas.bind("<Button-1>", self.on_preview_left_click)
-        self.preview.canvas.bind("<Button-3>", self.on_preview_right_click)
+        self.main_pane = ttk.Panedwindow(self, orient="horizontal")
+        self.main_pane.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
 
-        side = ttk.Frame(self, padding=8)
-        side.grid(row=1, column=1, sticky="nswe", padx=(4, 8), pady=(0, 8))
+        self.preview = ScrollableImage(self.main_pane)
+        self.main_pane.add(self.preview, weight=4)
+        self.preview.canvas.bind("<ButtonPress-1>", self.on_preview_left_press)
+        self.preview.canvas.bind("<B1-Motion>", self.on_preview_left_drag)
+        self.preview.canvas.bind("<ButtonRelease-1>", self.on_preview_left_release)
+        self.preview.canvas.bind("<ButtonPress-3>", self.on_preview_right_press)
+        self.preview.canvas.bind("<B3-Motion>", self.on_preview_right_drag)
+        self.preview.canvas.bind("<ButtonRelease-3>", self.on_preview_right_release)
+
+        side = ttk.Frame(self.main_pane, padding=8)
+        self.main_pane.add(side, weight=2)
         side.columnconfigure(0, weight=1)
 
         ttk.Label(side, text="Display").grid(row=0, column=0, sticky="w")
@@ -553,9 +598,7 @@ class LevelViewTab(ttk.Frame):
             self._enemy_slot_photos[slot] = photo
             self.enemy_slot_image_labels[slot].configure(image=photo)
         if slot < len(self.enemy_slot_text_labels):
-            preview_frame = ENEMY_TYPE_TO_DISPLAY_FRAME.get(enemy_type, 0)
-            summary = f"Enemy {enemy_type}\npreview frame {preview_frame}"
-            self.enemy_slot_text_labels[slot].configure(text=summary)
+            self.enemy_slot_text_labels[slot].configure(text=f"Enemy {enemy_type}")
 
     def _change_enemy_slot(self, slot: int, delta: int) -> None:
         if self._metadata_refreshing:
@@ -568,26 +611,30 @@ class LevelViewTab(ttk.Frame):
     def _on_background_selected(self, _event: tk.Event | None = None) -> None:
         if self._metadata_refreshing:
             return
+        before = self._capture_edit_state()
         try:
             fill_sprite = int(self.background_choice_var.get())
             self.background_store.set_fill_sprite_for_level(self._current_level_number(), fill_sprite)
             self._update_background_preview()
-            self._update_modified_status()
+            self._commit_edit_state(before)
             self.render_level(refresh_metadata=False)
         except Exception as exc:
             messagebox.showerror("Background update failed", str(exc))
+            self._restore_edit_state(before)
             self._refresh_level_metadata_tab()
 
     def apply_level_metadata(self) -> None:
+        before = self._capture_edit_state()
         try:
             level = self._current_level_number()
             self.level_store.set_spawn_interval(level, int(self.spawn_interval_var.get()))
             for slot, enemy_type in enumerate(self.enemy_slot_values):
                 self.level_store.set_enemy_sequence_value(level, slot, int(enemy_type))
-            self._update_modified_status()
+            self._commit_edit_state(before)
             self.render_level(refresh_metadata=True)
         except Exception as exc:
             messagebox.showerror("Metadata update failed", str(exc))
+            self._restore_edit_state(before)
             self._refresh_level_metadata_tab()
 
     def _set_info(self, text: str) -> None:
@@ -596,6 +643,16 @@ class LevelViewTab(ttk.Frame):
         self.info.insert("1.0", text)
         self.info.configure(state="disabled")
 
+    def _preview_scale(self) -> int:
+        raw = self.zoom_var.get().strip().lower().replace("×", "x")
+        if raw.endswith("x"):
+            raw = raw[:-1]
+        try:
+            scale = int(raw)
+        except ValueError:
+            scale = 4
+        return max(1, min(8, scale))
+
     def _current_level_number(self) -> int:
         return max(1, min(self.level_var.get(), self.level_store.level_count))
 
@@ -603,8 +660,8 @@ class LevelViewTab(ttk.Frame):
         return self.level_store.render_level(self._current_level_number())
 
     def _cell_at_image_xy(self, image_x: float, image_y: float):
-        x = int(image_x) // (BRICK_STEP_W * self.PREVIEW_SCALE)
-        y = int(image_y) // (BRICK_STEP_H * self.PREVIEW_SCALE)
+        x = int(image_x) // (BRICK_STEP_W * self._preview_scale())
+        y = int(image_y) // (BRICK_STEP_H * self._preview_scale())
         if 0 <= x < BRICK_GRID_WIDTH and 0 <= y < BRICK_GRID_HEIGHT:
             return self.level_store.get_cell(self._current_level_number(), x, y)
         return None
@@ -634,45 +691,147 @@ class LevelViewTab(ttk.Frame):
     def _inspect_cell(self, cell) -> None:
         self.selected_cell_text = self._cell_text(cell)
 
-    def on_preview_left_click(self, event: tk.Event) -> None:
+    def _capture_edit_state(self) -> tuple[bytes, list[int]]:
+        return bytes(self.level_store.decoded), list(self.background_store.mapping)
+
+    def _restore_edit_state(self, state: tuple[bytes, list[int]]) -> None:
+        decoded, background_mapping = state
+        self.level_store.decoded = bytearray(decoded)
+        self.background_store.mapping = list(background_mapping)
+        self.level_store.modified = True
+        self.background_store.modified = True
+
+    def _state_changed(self, before: tuple[bytes, list[int]]) -> bool:
+        return before != self._capture_edit_state()
+
+    def _commit_edit_state(self, before: tuple[bytes, list[int]] | None) -> None:
+        if before is None:
+            return
+        if self._state_changed(before):
+            self.undo_stack.append(before)
+            self.redo_stack.clear()
+        self._update_modified_status()
+
+    def undo(self) -> None:
+        if not self.undo_stack:
+            return
+        current = self._capture_edit_state()
+        previous = self.undo_stack.pop()
+        self.redo_stack.append(current)
+        self._restore_edit_state(previous)
+        self._refresh_level_metadata_tab()
+        self.render_level(refresh_metadata=False)
+
+    def redo(self) -> None:
+        if not self.redo_stack:
+            return
+        current = self._capture_edit_state()
+        next_state = self.redo_stack.pop()
+        self.undo_stack.append(current)
+        self._restore_edit_state(next_state)
+        self._refresh_level_metadata_tab()
+        self.render_level(refresh_metadata=False)
+
+    def clear_level(self) -> None:
+        level = self._current_level_number()
+        if not messagebox.askyesno("Clear level", f"Clear all brick and spell cells in level {level:02d}?"):
+            return
+        before = self._capture_edit_state()
+        self.level_store.clear_level(level)
+        self.selected_cell_text = f"Level {level:02d} grid cleared."
+        self._commit_edit_state(before)
+        self.render_level()
+
+    def _cell_from_event(self, event: tk.Event):
         image_x = self.preview.canvas.canvasx(event.x)
         image_y = self.preview.canvas.canvasy(event.y)
-        cell = self._cell_at_image_xy(image_x, image_y)
+        return self._cell_at_image_xy(image_x, image_y), image_x, image_y
+
+    def _begin_preview_edit(self, event: tk.Event, button: str) -> None:
+        if self.view_var.get() != "game":
+            self.selected_cell_text = "Map editing is available in the game view."
+            self.render_level(refresh_metadata=False)
+            return
+        cell, image_x, image_y = self._cell_from_event(event)
         if cell is None:
             self.selected_cell_text = f"Clicked outside level grid at image x={int(image_x)}, y={int(image_y)}."
             self.render_level()
             return
+        self._drag_snapshot = self._capture_edit_state()
+        self._drag_button = button
+        self._drag_visited = set()
+        self._apply_preview_edit(cell, button, allow_spells=True)
 
-        level = self._current_level_number()
-        editor_kind = self.editor_palettes.active_editor_kind()
-        if editor_kind == "bricks":
-            self.level_store.set_brick_sprite_id(level, cell.x, cell.y, self.selected_brick_sprite_id)
-        elif editor_kind == "spells":
-            self.level_store.set_spell_drop_type(level, cell.x, cell.y, self.selected_spell_drop_type)
-
-        self._inspect_cell(self.level_store.get_cell(level, cell.x, cell.y))
-        self._update_modified_status()
-        self.render_level()
-
-    def on_preview_right_click(self, event: tk.Event) -> None:
-        image_x = self.preview.canvas.canvasx(event.x)
-        image_y = self.preview.canvas.canvasy(event.y)
-        cell = self._cell_at_image_xy(image_x, image_y)
-        if cell is None:
-            self.selected_cell_text = f"Clicked outside level grid at image x={int(image_x)}, y={int(image_y)}."
-            self.render_level()
+    def _drag_preview_edit(self, event: tk.Event, button: str) -> None:
+        if self._drag_button != button:
             return
+        if self.editor_palettes.active_editor_kind() != "bricks":
+            return
+        cell, _image_x, _image_y = self._cell_from_event(event)
+        if cell is None:
+            return
+        self._apply_preview_edit(cell, button, allow_spells=False)
+
+    def _finish_preview_edit(self, button: str) -> None:
+        if self._drag_button != button:
+            return
+        before = self._drag_snapshot
+        self._drag_snapshot = None
+        self._drag_button = None
+        self._drag_visited = set()
+        self._commit_edit_state(before)
+        self.render_level()
+
+    def _apply_preview_edit(self, cell, button: str, allow_spells: bool) -> None:
+        key = (cell.x, cell.y)
+        if key in self._drag_visited:
+            return
+        self._drag_visited.add(key)
 
         level = self._current_level_number()
         editor_kind = self.editor_palettes.active_editor_kind()
+        edit_message: str | None = None
         if editor_kind == "bricks":
-            self.level_store.erase_brick(level, cell.x, cell.y)
-        elif editor_kind == "spells":
-            self.level_store.erase_spell(level, cell.x, cell.y)
+            if button == "left":
+                self.level_store.set_brick_sprite_id(level, cell.x, cell.y, self.selected_brick_sprite_id)
+            elif button == "right":
+                self.level_store.erase_brick(level, cell.x, cell.y)
+        elif allow_spells and editor_kind == "spells":
+            if button == "left":
+                applied = self.level_store.set_spell_drop_type(level, cell.x, cell.y, self.selected_spell_drop_type)
+                if not applied:
+                    edit_message = (
+                        f"Spell drop not applied at x={cell.x}, y={cell.y}. "
+                        "Spells are allowed only on base breakable bricks 0..47 "
+                        "(auto-converted to dotted variants 48..95) or existing dotted variants 48..95."
+                    )
+            elif button == "right":
+                self.level_store.erase_spell(level, cell.x, cell.y)
 
-        self._inspect_cell(self.level_store.get_cell(level, cell.x, cell.y))
+        inspected = self.level_store.get_cell(level, cell.x, cell.y)
+        self._inspect_cell(inspected)
+        if edit_message is not None:
+            self.selected_cell_text = edit_message + "\n\n" + self.selected_cell_text
         self._update_modified_status()
-        self.render_level()
+        self.render_level(refresh_metadata=False)
+
+    def on_preview_left_press(self, event: tk.Event) -> None:
+        self._begin_preview_edit(event, "left")
+
+    def on_preview_left_drag(self, event: tk.Event) -> None:
+        self._drag_preview_edit(event, "left")
+
+    def on_preview_left_release(self, _event: tk.Event) -> None:
+        self._finish_preview_edit("left")
+
+    def on_preview_right_press(self, event: tk.Event) -> None:
+        self._begin_preview_edit(event, "right")
+
+    def on_preview_right_drag(self, event: tk.Event) -> None:
+        self._drag_preview_edit(event, "right")
+
+    def on_preview_right_release(self, _event: tk.Event) -> None:
+        self._finish_preview_edit("right")
 
     def on_brick_selected(self, sprite_id: int) -> None:
         self.selected_brick_sprite_id = sprite_id
@@ -687,7 +846,8 @@ class LevelViewTab(ttk.Frame):
         if kind == "bricks":
             text = (
                 f"Brick editor: selected KE_BRICK image {self.selected_brick_sprite_id}. "
-                "Left click inserts/replaces a brick. Right click clears the entire cell."
+                "Left click inserts/replaces a non-spell brick. Right click clears the entire cell. "
+                "Dotted spell variants 48..95 are created automatically by the Spells tab."
             )
         elif kind == "spells":
             frames = SPELL_DROP_TYPE_TO_FRAMES.get(self.selected_spell_drop_type or 0, [])
@@ -695,7 +855,9 @@ class LevelViewTab(ttk.Frame):
             text = (
                 f"Spell editor: selected drop type {self.selected_spell_drop_type}"
                 f"{f' ({name})' if name else ''}. "
-                "Left click writes spell/drop metadata. Right click removes only the spell metadata."
+                "Left click writes spell/drop metadata only on base breakable bricks 0..47 "
+                "(auto-converted to dotted variants 48..95). Right click removes the spell and converts "
+                "48..95 back to 0..47."
             )
         else:
             text = "Inspector/metadata tab: level clicks only inspect cells; switch to Bricks or Spells to edit the map."
@@ -734,7 +896,7 @@ class LevelViewTab(ttk.Frame):
             image = make_game_level_preview(
                 self.data_dir,
                 number=number,
-                scale=self.PREVIEW_SCALE,
+                scale=self._preview_scale(),
                 show_grid=self.show_grid_var.get(),
                 show_ids=self.show_ids_var.get(),
                 show_spells=self.show_spells_var.get(),
@@ -753,7 +915,7 @@ class LevelViewTab(ttk.Frame):
                 f"{self.selected_cell_text}"
             )
         elif view == "spells":
-            image = make_level_preview(self.data_dir, number=number, view="spells", scale=3, level_override=self.level_store.render_level(number))
+            image = make_level_preview(self.data_dir, number=number, view="spells", scale=self._preview_scale(), level_override=self.level_store.render_level(number))
             self.preview.set_image(image)
             level = self.level_store.render_level(number)
             nonzero = sum(1 for cell in level.cells if cell.flags)
@@ -763,7 +925,7 @@ class LevelViewTab(ttk.Frame):
                 "This diagnostic view reflects the current in-memory editor state."
             )
         elif view == "bricks":
-            image = make_level_preview(self.data_dir, number=number, view="bricks", scale=3, level_override=self.level_store.render_level(number))
+            image = make_level_preview(self.data_dir, number=number, view="bricks", scale=self._preview_scale(), level_override=self.level_store.render_level(number))
             self.preview.set_image(image)
             level = self.level_store.render_level(number)
             nonzero = sum(1 for cell in level.cells if cell.brick_id)
@@ -777,7 +939,7 @@ class LevelViewTab(ttk.Frame):
             image = make_game_level_preview(
                 self.data_dir,
                 number=number,
-                scale=self.PREVIEW_SCALE,
+                scale=self._preview_scale(),
                 level_override=level,
                 background_fill_sprite_id=self.background_store.get_fill_sprite_for_level(number),
             )
