@@ -98,3 +98,34 @@ def decode_cod(data: bytes) -> CodDecodeResult:
 
 def decode_file(path: Path) -> CodDecodeResult:
     return decode_cod(path.read_bytes())
+
+
+def encode_cod2(decoded_payload: bytes, key_seed_word: int) -> bytes:
+    """Encode a decoded payload back into the game's COD2 wrapper.
+
+    COD2 is symmetric XOR for the first min(len(payload), 0x400) bytes. The
+    checksum stored in the trailer is computed from the decoded dwords, exactly
+    as the game decoder verifies it.
+    """
+    key_seed_word &= 0xFFFF
+    key = (ror16(key_seed_word, 7) << 16) | rol16(key_seed_word, 3)
+    out = bytearray(decoded_payload)
+    limit = (min(len(out), 0x400) // 4) * 4
+    rolling_xor = 0
+
+    for offset in range(0, limit, 4):
+        decoded_value = int.from_bytes(out[offset : offset + 4], "little")
+        rolling_xor ^= decoded_value
+        encoded_value = decoded_value ^ key
+        out[offset : offset + 4] = encoded_value.to_bytes(4, "little")
+        key = rol32(key, 1)
+
+    checksum = (rolling_xor & 0xFFFF) ^ ((rolling_xor >> 16) & 0xFFFF)
+    out.extend(checksum.to_bytes(2, "little"))
+    out.extend(key_seed_word.to_bytes(2, "little"))
+    out.extend(b"COD2")
+    return bytes(out)
+
+
+def encode_file_cod2(path: Path, decoded_payload: bytes, key_seed_word: int) -> None:
+    path.write_bytes(encode_cod2(decoded_payload, key_seed_word))

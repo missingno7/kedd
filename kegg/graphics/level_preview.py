@@ -6,12 +6,24 @@ from typing import List
 from PIL import Image, ImageDraw
 
 from kegg.formats.bob_decode import decode_bob_sprites
-from kegg.formats.level import BRICK_GRID_HEIGHT, BRICK_GRID_WIDTH, load_level_set, parse_render_levels
+from kegg.formats.level import (
+    BRICK_GRID_HEIGHT,
+    BRICK_GRID_WIDTH,
+    RenderLevel,
+    load_level_set,
+    parse_render_levels,
+)
 from kegg.formats.palette import RGB, default_palette, load_vga_palette
 
 
 BRICK_STEP_W = 16  # KE_BRICK sprite width 15 + one pixel spacing
 BRICK_STEP_H = 9   # KE_BRICK sprite height 8 + one pixel spacing
+
+# KE.EXE background filler:
+#   table DS:0x2E9C points to KE_FILL.BOB sprites 6..46
+#   ds:0xDF38 starts at -1 and increments on each new level, wrapping at 0x29
+BACKGROUND_FILL_FIRST = 6
+BACKGROUND_FILL_COUNT = 41
 
 
 def _palette_for(data_dir: Path) -> List[RGB]:
@@ -24,26 +36,59 @@ def _palette_for(data_dir: Path) -> List[RGB]:
     return default_palette()
 
 
-def make_level_preview(data_dir: Path, number: int = 2, view: str = "bricks", scale: int = 3) -> Image.Image:
+def background_fill_sprite_id_for_level(level_number: int) -> int:
+    return BACKGROUND_FILL_FIRST + ((max(1, level_number) - 1) % BACKGROUND_FILL_COUNT)
+
+
+def make_background_grid(
+    data_dir: Path,
+    level_number: int,
+    width: int,
+    height: int,
+    fill_sprite_id: int | None = None,
+) -> Image.Image:
+    fill_sprites, _ = decode_bob_sprites(data_dir / "KE_FILL.BOB", data_dir)
+    sprite_id = fill_sprite_id if fill_sprite_id is not None else background_fill_sprite_id_for_level(level_number)
+    if not (0 <= sprite_id < len(fill_sprites)):
+        return Image.new("RGBA", (width, height), (0, 43, 48, 255))
+
+    tile = fill_sprites[sprite_id].convert("RGBA")
+    if tile.width <= 0 or tile.height <= 0:
+        return Image.new("RGBA", (width, height), (0, 43, 48, 255))
+
+    background = Image.new("RGBA", (width, height), (0, 43, 48, 255))
+    for y in range(0, height, tile.height):
+        for x in range(0, width, tile.width):
+            background.alpha_composite(tile, (x, y))
+    return background
+
+
+def make_level_preview(data_dir: Path, number: int = 2, view: str = "bricks", scale: int = 3, level_override: RenderLevel | None = None) -> Image.Image:
     """
     Raw diagnostic grid view.
 
     Supported views:
       - "spells" / "logic0": low bytes from the render word grid
       - "bricks" / "logic1": high bytes from the render word grid
-      - "visual": raw KE_LVL.DIG visual grid (kept only for compatibility)
+      - "visual": raw KE_LVL.DIG visual grid (kept only for CLI compatibility)
     """
     levels = load_level_set(data_dir)
     number = max(1, min(number, levels.level_count))
     palette = _palette_for(data_dir)
 
     if view in ("spells", "logic0"):
-        layer_index = 0
-        cells = levels.logic_levels[number - 1].layers[layer_index]
+        if level_override is not None:
+            cells = bytes(cell.flags for cell in level_override.cells)
+        else:
+            layer_index = 0
+            cells = levels.logic_levels[number - 1].layers[layer_index]
         title = f"Level {number:02d} spells / low-byte codes"
     elif view in ("bricks", "logic1"):
-        layer_index = 1
-        cells = levels.logic_levels[number - 1].layers[layer_index]
+        if level_override is not None:
+            cells = bytes(cell.brick_id for cell in level_override.cells)
+        else:
+            layer_index = 1
+            cells = levels.logic_levels[number - 1].layers[layer_index]
         title = f"Level {number:02d} bricks / high-byte ids"
     else:
         cells = levels.visual_levels[number - 1].cells
@@ -89,7 +134,6 @@ def _draw_grid_overlay(draw: ImageDraw.ImageDraw, scale: int) -> None:
 def _draw_id_overlay(draw: ImageDraw.ImageDraw, x0: int, y0: int, cell_w: int, label: str) -> None:
     pad_x = 2
     pad_y = 1
-    # Approximate text box width for the default bitmap font.
     box_w = max(12, len(label) * 6 + pad_x * 2)
     box_h = 11
     draw.rectangle((x0, y0, x0 + min(cell_w - 1, box_w), y0 + box_h), fill=(0, 0, 0, 190))
@@ -103,24 +147,42 @@ def make_game_level_preview(
     show_grid: bool = False,
     show_ids: bool = False,
     show_spells: bool = False,
+    show_background: bool = True,
+    level_override: RenderLevel | None = None,
+    background_fill_sprite_id: int | None = None,
 ) -> Image.Image:
     """
     Render gameplay brick grid using KE_BRICK.BOB.
 
-    Important:
-      - the gameplay image itself is first rendered cleanly and scaled with nearest-neighbor
-      - ids / spell icons / grid are then drawn as a separate overlay layer on the final scaled image
-        so they stay readable and do not distort the source pixels
+    The game image is rendered cleanly at native scale, then scaled; ids, spell
+    icons, and grid are drawn afterwards as readable overlays.
     """
-    render_levels = parse_render_levels(data_dir / "KE_LDCWC.TAB")
-    number = max(1, min(number, len(render_levels)))
-    level = render_levels[number - 1]
+    if level_override is None:
+        render_levels = parse_render_levels(data_dir / "KE_LDCWC.TAB")
+        number = max(1, min(number, len(render_levels)))
+        level = render_levels[number - 1]
+    else:
+        level = level_override
+        number = level.number
+
     brick_sprites, _ = decode_bob_sprites(data_dir / "KE_BRICK.BOB", data_dir)
     spell_sprites = []
     if show_spells:
         spell_sprites, _ = decode_bob_sprites(data_dir / "KE_SPELL.BOB", data_dir)
 
-    base = Image.new("RGBA", (BRICK_GRID_WIDTH * BRICK_STEP_W, BRICK_GRID_HEIGHT * BRICK_STEP_H), (0, 43, 48, 255))
+    base_width = BRICK_GRID_WIDTH * BRICK_STEP_W
+    base_height = BRICK_GRID_HEIGHT * BRICK_STEP_H
+    if show_background:
+        base = make_background_grid(
+            data_dir,
+            number,
+            base_width,
+            base_height,
+            fill_sprite_id=background_fill_sprite_id,
+        )
+    else:
+        base = Image.new("RGBA", (base_width, base_height), (0, 43, 48, 255))
+
     for cell in level.cells:
         x0 = cell.x * BRICK_STEP_W
         y0 = cell.y * BRICK_STEP_H
@@ -156,7 +218,6 @@ def make_game_level_preview(
             spell_sprite_index = cell.powerup_spell_bob_sprite_index
             if spell_sprite_index is not None and 0 <= spell_sprite_index < len(spell_sprites):
                 icon = spell_sprites[spell_sprite_index].convert("RGBA")
-                # Keep the spell overlay visually smaller than the enlarged gameplay image.
                 max_w = max(10, int(cell_w * 0.62))
                 max_h = max(10, int(cell_h * 0.62))
                 ratio = min(max_w / icon.width, max_h / icon.height)

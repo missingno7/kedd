@@ -1,15 +1,17 @@
 # GUI Level View
 
-Recent cleanup:
-- Removed the useless `game_data: game_data` label from the header.
-- Removed the Render button; the view now updates automatically.
-- View names are now user-friendly:
-  - `game`
-  - `spells` (old `logic0`, low-byte spell/drop codes)
-  - `bricks` (old `logic1`, high-byte brick ids)
-- The old `visual` view is no longer shown in the GUI.
+Right-side notebook tabs:
 
-Overlay behavior:
-- Brick ids are drawn as an overlay on the already-scaled image.
-- Spell icons are drawn as a smaller overlay on top of the already-scaled image.
-- This keeps the gameplay pixels clean and makes debug overlays easier to read.
+- **Bricks** — image palette of `KE_BRICK.BOB`, left click places, right click erases a whole cell.
+- **Spells** — image palette of logical EXE-derived drop types, left click writes spell metadata, right click removes only spell metadata.
+- **Cell Inspector** — selected cell details moved out of the main side panel into its own tab.
+- **Level Metadata** — editable level-level properties:
+  - background KE_FILL sprite via the EXE background table
+  - raw/inferred enemy spawn timer
+  - eight enemy spawn-cycle slots shown as enemy image cards
+
+`Save data` writes:
+- `KE_LDCWC.TAB` when level grid/metadata changed
+- `KE.EXE` when the background table changed
+
+Both files receive a `.bak` backup on first save.

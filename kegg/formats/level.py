@@ -145,6 +145,36 @@ def format_grid(rows: Sequence[Sequence[int]]) -> str:
 RENDER_WORD_GRID_OFFSET = LOGIC_LEVEL_HEADER_SIZE
 RENDER_WORD_GRID_SIZE_BYTES = BRICK_GRID_SIZE * 2
 
+# Enemy spawn types used by the per-level 8-byte enemy cycle.
+#
+# KE.EXE spawn flow:
+#   - reads one raw enemy type byte from the level header cycle
+#   - clamps it to 0..7
+#   - uses that value directly as the index into the animation pointer table at DS:0x6790
+#
+# Therefore the stored raw values already are the editor-facing Enemy 0..7 IDs:
+#   0 -> Enemy 0, 1 -> Enemy 1, ..., 7 -> Enemy 7.
+#
+# These frame sequences are derived from the EXE table. Enemy 2 uses the extra
+# KE_NMY.BOB frames 64/65 as part of its full in-game animation sequence.
+ENEMY_TYPE_TO_FRAMES: dict[int, list[int]] = {
+    0: [0, 1],
+    1: [2, 3, 4, 3],
+    2: [5, 5, 5, 5, 6, 7, 64, 65, 64, 7, 6],
+    3: [8, 9, 10],
+    4: [11, 12, 13, 12],
+    5: [14, 15, 16, 15],
+    6: [17, 18, 19, 20, 21, 22],
+    7: [23, 24, 25, 26, 27, 28, 29, 30],
+}
+
+ENEMY_TYPE_TO_DISPLAY_FRAME: dict[int, int] = {
+    enemy_type: frames[0]
+    for enemy_type, frames in ENEMY_TYPE_TO_FRAMES.items()
+    if frames
+}
+
+
 # Gameplay powerups / spell sprites.
 #
 # Confirmed from KE.EXE:
